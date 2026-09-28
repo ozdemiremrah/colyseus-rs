@@ -68,6 +68,8 @@ pub(crate) struct ClientInner {
     pub tap: RwLock<Option<crate::room::EventTap>>,
     /// Rate limiting window: (window_start, count).
     pub rate: Mutex<(Instant, u32)>,
+    /// Set by [`Client::leave`]: the server closed this connection itself.
+    pub server_closed: std::sync::atomic::AtomicBool,
 }
 
 /// A handle to a connected client.
@@ -94,6 +96,7 @@ impl Client {
                 after_patch: RwLock::new(None),
                 tap: RwLock::new(None),
                 rate: Mutex::new((Instant::now(), 0)),
+                server_closed: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -191,6 +194,9 @@ impl Client {
 
     /// Close this client's connection.
     pub fn leave(&self, code: Option<u16>, reason: Option<&str>) {
+        self.inner
+            .server_closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.set_state(ClientState::Leaving);
         let _ = self.inner.tx.send(Outbound::Close(
             code.unwrap_or(close_codes::NORMAL_CLOSURE),
@@ -233,6 +239,13 @@ impl Client {
     /// (Used for reconnecting clients whose socket is being recycled.)
     pub(crate) fn close_transport(&self, code: u16, reason: &str) {
         let _ = self.inner.tx.send(Outbound::Close(code, reason.to_string()));
+    }
+
+    /// True once [`Client::leave`] was called for this connection.
+    pub(crate) fn server_closed(&self) -> bool {
+        self.inner
+            .server_closed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn set_state(&self, state: ClientState) {

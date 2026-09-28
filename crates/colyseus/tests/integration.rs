@@ -41,6 +41,27 @@ impl Room for ChatRoom {
     }
 }
 
+/// Closes a client from the server side (`Client::leave`) on request and
+/// announces every leave.
+struct KickRoom;
+
+#[async_trait]
+impl Room for KickRoom {
+    async fn on_create(&mut self, ctx: &mut RoomContext, _options: Value) -> Result<()> {
+        ctx.on_message("kick_me", |_room: &mut KickRoom, _ctx, client, _msg: Value| {
+            Box::pin(async move {
+                client.leave(Some(4000), Some("kicked"));
+                Ok(())
+            })
+        });
+        Ok(())
+    }
+
+    async fn on_leave(&mut self, ctx: &mut RoomContext, client: Client, _code: u16) {
+        ctx.broadcast("left", &json!({ "who": client.session_id() }));
+    }
+}
+
 /// Internal room type: only creatable server-side.
 struct InternalRoom;
 
@@ -253,6 +274,7 @@ async fn start_server() -> TestServer {
     server.define("auth", || AuthRoom);
     server.define("internal", || InternalRoom).internal();
     server.define("greeter", || GreeterRoom);
+    server.define("kick", || KickRoom);
 
     let (app, mm) = server.build();
     // server-side creation of an internal room (no seat, no auth)
@@ -349,6 +371,33 @@ impl WsClient {
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
+
+/// A client the server closes itself must really leave: `on_leave` runs
+/// and the others are told. It used to stay in the room as a ghost.
+#[tokio::test]
+async fn server_closed_client_leaves_the_room() {
+    let server = start_server().await;
+    let r1 = matchmake(&server.base, "joinOrCreate", "kick", json!({})).await;
+    let r2 = matchmake(&server.base, "joinOrCreate", "kick", json!({})).await;
+    assert_eq!(r1["room"]["roomId"], r2["room"]["roomId"]);
+
+    let mut c1 = WsClient::connect(&server.base, &r1).await;
+    let mut c2 = WsClient::connect(&server.base, &r2).await;
+    assert_eq!(c1.recv().await[0], 10);
+    assert_eq!(c2.recv().await[0], 10);
+
+    c1.send("kick_me", json!({})).await;
+
+    let kicked = r1["sessionId"].as_str().unwrap().to_string();
+    loop {
+        let msg = c2.recv().await;
+        if msg[0] == 13 && msg[1] == "left" {
+            assert_eq!(msg[2]["who"], kicked.as_str());
+            break;
+        }
+    }
+    c1.close().await;
+}
 
 #[tokio::test]
 async fn join_chat_and_broadcast() {

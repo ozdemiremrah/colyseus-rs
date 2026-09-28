@@ -372,6 +372,14 @@ impl Server {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| ServerError::new(codes::APPLICATION_ERROR, e.to_string()))?;
+        // Game traffic is small, latency-bound writes (the writer already
+        // batches per flush): Nagle would hold them back waiting for ACKs.
+        use axum::serve::ListenerExt;
+        let listener = listener.tap_io(|tcp| {
+            if let Err(e) = tcp.set_nodelay(true) {
+                tracing::debug!("TCP_NODELAY: {e}");
+            }
+        });
 
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
@@ -621,6 +629,11 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, handle, params))
 }
 
+/// Most messages one writer flush carries.
+const WRITE_BATCH_MAX: usize = 64;
+/// How long the reader waits for the client's reply after the server sent Close.
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 async fn handle_socket(socket: WebSocket, room: RoomHandle, params: WsParams) {
     use futures::{SinkExt, StreamExt};
 
@@ -644,23 +657,46 @@ async fn handle_socket(socket: WebSocket, room: RoomHandle, params: WsParams) {
     let (mut sink, mut stream) = socket.split();
 
     // writer task
+    //
+    // Everything already queued goes out with ONE flush. A room tick queues
+    // several messages per client (state/delta, events, notices); flushing
+    // each (`send`) turned every one into its own write - behind a proxy its
+    // own TLS record and TCP segment, the headers costing about as much as
+    // the payload. `feed` buffers, `flush` writes the batch.
+    let close_sent = Arc::new(tokio::sync::Notify::new());
+    let writer_close_sent = close_sent.clone();
     let writer = tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
-            match msg {
-                Outbound::Bytes(bytes) => {
-                    if sink.send(WsMessage::Binary(bytes)).await.is_err() {
-                        break;
+        'conn: while let Some(first) = outbound_rx.recv().await {
+            let mut next = Some(first);
+            let mut fed = 0usize;
+            while let Some(msg) = next.take() {
+                match msg {
+                    Outbound::Bytes(bytes) => {
+                        if sink.feed(WsMessage::Binary(bytes)).await.is_err() {
+                            break 'conn;
+                        }
+                        fed += 1;
+                    }
+                    Outbound::Close(code, reason) => {
+                        let _ = sink
+                            .feed(WsMessage::Close(Some(CloseFrame {
+                                code,
+                                reason: reason.into(),
+                            })))
+                            .await;
+                        let _ = sink.flush().await;
+                        writer_close_sent.notify_one();
+                        break 'conn;
                     }
                 }
-                Outbound::Close(code, reason) => {
-                    let _ = sink
-                        .send(WsMessage::Close(Some(CloseFrame {
-                            code,
-                            reason: reason.into(),
-                        })))
-                        .await;
+                // Bounded, so one huge backlog cannot hold a flush back.
+                if fed >= WRITE_BATCH_MAX {
                     break;
                 }
+                next = outbound_rx.try_recv().ok();
+            }
+            if sink.flush().await.is_err() {
+                break;
             }
         }
     });
@@ -682,8 +718,26 @@ async fn handle_socket(socket: WebSocket, room: RoomHandle, params: WsParams) {
     }
 
     // reader loop
+    //
+    // After the server itself sent a Close (kick, takeover, room error) the
+    // loop waits only CLOSE_GRACE for the client's reply: a client whose
+    // network is gone never answers, and until the loop ends the room does
+    // not learn the client left - it stayed seated until the TCP timeout.
     let mut close_code = close_codes::ABNORMAL_CLOSURE;
-    while let Some(frame) = stream.next().await {
+    let mut close_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    loop {
+        let frame = tokio::select! {
+            frame = stream.next() => frame,
+            _ = close_sent.notified(), if close_deadline.is_none() => {
+                close_deadline = Some(Box::pin(tokio::time::sleep(CLOSE_GRACE)));
+                continue;
+            }
+            _ = async { close_deadline.as_mut().expect("guarded").await }, if close_deadline.is_some() => {
+                close_code = close_codes::CONSENTED;
+                break;
+            }
+        };
+        let Some(frame) = frame else { break };
         match frame {
             Ok(WsMessage::Binary(bytes)) => match protocol::decode_client_message(&bytes) {
                 Some(ClientMessage::Leave) => {

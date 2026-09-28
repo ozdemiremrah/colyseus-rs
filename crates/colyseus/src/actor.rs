@@ -860,8 +860,26 @@ impl RoomActor {
 
     /// Shared leave logic. `consented` skips `on_drop` (explicit leave).
     async fn leave_client(&mut self, client: Client, code: u16, consented: bool) {
-        if matches!(client.state(), ClientState::Leaving | ClientState::Closed) {
-            return;
+        let mut consented = consented;
+        match client.state() {
+            ClientState::Closed => return,
+            // A client the room closed itself (`Client::leave`: kick, session
+            // takeover, admin kick) is marked Leaving before its socket
+            // closes. `on_leave` never ran for it and it stayed in the client
+            // list: a ghost the room kept simulating. Finish its leave now, as
+            // a consented one (no `on_drop`, no reconnection window).
+            ClientState::Leaving
+                if client.server_closed()
+                    && self
+                        .ctx
+                        .clients
+                        .iter()
+                        .any(|c| c.inner.connection_id == client.inner.connection_id) =>
+            {
+                consented = true;
+            }
+            ClientState::Leaving => return,
+            _ => {}
         }
         client.set_state(ClientState::Leaving);
 
